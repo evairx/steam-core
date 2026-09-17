@@ -1,9 +1,9 @@
 use base64::Engine;
 use rsa::traits::PublicKeyParts;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
-use steam_auth::{
-    encrypt_password, EAuthSessionGuardType, EAuthTokenPlatformType, EResult,
-    ESessionPersistence, SteamApiClient, SteamError,
+use steam_core::{
+    encrypt_password, EAuthSessionGuardType, EAuthTokenPlatformType, EPersonaState, EResult,
+    ESessionPersistence, SteamApiClient, SteamError, SteamUser, SteamUserOptions,
 };
 
 #[test]
@@ -95,7 +95,7 @@ fn test_error_hierarchy() {
 
 #[test]
 fn test_jwt_decode_and_expiration_logic() {
-    use steam_auth::{decode_jwt, is_token_expired};
+    use steam_core::{decode_jwt, is_token_expired};
 
     // Construct a JWT with a fixed future timestamp
     let future_exp = std::time::SystemTime::now()
@@ -126,7 +126,7 @@ fn test_jwt_decode_and_expiration_logic() {
 
 #[test]
 fn test_saved_session_persistence_roundtrip() {
-    use steam_auth::{SavedSession, SteamWebCookies};
+    use steam_core::{SavedSession, SteamWebCookies};
 
     let session = SavedSession {
         account_name: "steam_developer".into(),
@@ -152,3 +152,54 @@ fn test_saved_session_persistence_roundtrip() {
     assert_eq!(recovered.cookies.session_id, "deadbeef01020304");
 }
 
+#[tokio::test]
+async fn test_steam_user_integration_with_authenticated_session() {
+    use steam_core::{AuthenticatedSession, LoginSession, SteamWebCookies};
+
+    let raw_session = LoginSession::new(EAuthTokenPlatformType::WebBrowser);
+    let cookies = SteamWebCookies {
+        session_id: "sess123".into(),
+        steam_login_secure: Some("76561198000000000||eyMock".into()),
+        all_cookies: vec!["sessionid=sess123".into()],
+    };
+
+    let auth_session = AuthenticatedSession::new(
+        "test_steam_user".into(),
+        76561198000000000,
+        "mock_refresh_token".into(),
+        "mock_access_token".into(),
+        cookies,
+        raw_session,
+    );
+
+    // Verify accessor methods on AuthenticatedSession
+    assert_eq!(auth_session.access_token(), "mock_access_token");
+    assert_eq!(auth_session.refresh_token(), "mock_refresh_token");
+    assert_eq!(auth_session.steam_id(), 76561198000000000);
+    assert_eq!(auth_session.account_name(), "test_steam_user");
+    assert_eq!(auth_session.session_id(), "sess123");
+    assert_eq!(
+        auth_session.bearer_auth_header(),
+        "Bearer mock_access_token"
+    );
+    assert!(auth_session.cookie_header().contains("steamLoginSecure="));
+
+    // Connect SteamUser using AuthenticatedSession
+    let mut user = SteamUser::connect(&auth_session, SteamUserOptions::default())
+        .await
+        .expect("connect succeeds");
+
+    assert_eq!(user.steam_id(), 76561198000000000);
+    assert_eq!(user.account_name(), "test_steam_user");
+    assert!(user.is_connected());
+
+    user.set_persona_state(EPersonaState::Online).await.unwrap();
+    assert_eq!(user.persona_state(), EPersonaState::Online);
+
+    user.set_games_played(&[730, 440]).await.unwrap();
+    assert_eq!(user.games_played(), &[730, 440]);
+
+    user.disconnect().await.unwrap();
+    assert!(!user.is_connected());
+    assert_eq!(user.persona_state(), EPersonaState::Offline);
+}

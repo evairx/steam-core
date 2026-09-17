@@ -1,8 +1,8 @@
 [package]
-name = "steam-auth"
+name = "steam-core"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance, native Steam authentication and session management library in Rust"
+description = "All-in-one high-performance Steam client and authentication library in Rust (unifying steam-session and steam-user)"
 license = "MIT OR Apache-2.0"
 authors = ["Google Antigravity & Pair Programmer"]
 readme = "README.md"

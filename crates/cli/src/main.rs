@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::time::Duration;
-use steam_auth::{
+use steam_core::{
     EAuthSessionGuardType, EAuthTokenPlatformType, LoginSession, PollStatus,
 };
 

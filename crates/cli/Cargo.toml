@@ -9,7 +9,7 @@ name = "steam-login"
 path = "src/main.rs"
 
 [dependencies]
-steam-auth = { path = "../core" }
+steam-core = { path = "../core" }
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
 rpassword = "7.3"
 tracing = "0.1"

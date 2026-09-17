@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::client::SteamWebCookies;
 use crate::error::{Result, SteamError};
 
-const SERVICE_NAME: &str = "steam-auth";
+const SERVICE_NAME: &str = "steam-core";
 
 /// Stored session data containing credentials, tokens, and web cookies.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

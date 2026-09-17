@@ -113,6 +113,61 @@ impl AuthenticatedSession {
     pub fn spawn_keeper(&self, interval: Option<Duration>) -> AutoKeeperHandle {
         AutoKeeper::spawn(Arc::clone(&self.session), self.cookies.clone(), interval)
     }
+
+    /// Returns the short-lived access token, specifically used for the Steam CM Client Logon
+    /// (`CMsgClientLogon.access_token`) and WebAPI calls.
+    pub fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
+    /// Returns the long-lived refresh token used for session persistence and renewal.
+    pub fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+
+    /// Returns the 64-bit SteamID of the authenticated user.
+    pub fn steam_id(&self) -> u64 {
+        self.steam_id
+    }
+
+    /// Returns the account login name.
+    pub fn account_name(&self) -> &str {
+        &self.account_name
+    }
+
+    /// Returns the `steamLoginSecure` cookie value if present.
+    pub fn steam_login_secure(&self) -> Option<&str> {
+        self.cookies.steam_login_secure.as_deref()
+    }
+
+    /// Returns the active web session ID (`sessionid` cookie).
+    pub fn session_id(&self) -> &str {
+        &self.cookies.session_id
+    }
+
+    /// Returns a pre-formatted HTTP `Cookie` header string containing `steamLoginSecure` and `sessionid`.
+    ///
+    /// Ready to be attached directly to requests to `steamcommunity.com` or `store.steampowered.com`.
+    pub fn cookie_header(&self) -> String {
+        match &self.cookies.steam_login_secure {
+            Some(login_secure) => {
+                if login_secure.starts_with("steamLoginSecure=") {
+                    format!("sessionid={}; {}", self.cookies.session_id, login_secure)
+                } else {
+                    format!(
+                        "sessionid={}; steamLoginSecure={}",
+                        self.cookies.session_id, login_secure
+                    )
+                }
+            }
+            None => format!("sessionid={}", self.cookies.session_id),
+        }
+    }
+
+    /// Returns a pre-formatted `Authorization: Bearer <access_token>` header value.
+    pub fn bearer_auth_header(&self) -> String {
+        format!("Bearer {}", self.access_token)
+    }
 }
 
 /// A pending QR code authentication challenge.
@@ -164,8 +219,8 @@ impl SteamAuth {
     ///
     /// # Example
     /// ```no_run
-    /// # async fn run() -> steam_auth::Result<()> {
-    /// use steam_auth::{SteamAuth, AuthEvent};
+    /// # async fn run() -> steam_core::Result<()> {
+    /// use steam_core::{SteamAuth, AuthEvent};
     ///
     /// let session = SteamAuth::login("username", "password", |event| {
     ///     match event {
@@ -329,8 +384,8 @@ impl SteamAuth {
     ///
     /// # Example
     /// ```no_run
-    /// # async fn run() -> steam_auth::Result<()> {
-    /// use steam_auth::SteamAuth;
+    /// # async fn run() -> steam_core::Result<()> {
+    /// use steam_core::SteamAuth;
     /// use std::time::Duration;
     ///
     /// let qr = SteamAuth::get_qr().await?;
@@ -357,8 +412,8 @@ impl SteamAuth {
     ///
     /// # Example
     /// ```no_run
-    /// # async fn run() -> steam_auth::Result<()> {
-    /// use steam_auth::SteamAuth;
+    /// # async fn run() -> steam_core::Result<()> {
+    /// use steam_core::SteamAuth;
     ///
     /// let session = SteamAuth::from_token("saved_refresh_token_here").await?;
     /// let cookies = session.get_cookies().await?;
