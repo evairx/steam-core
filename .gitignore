@@ -1,0 +1,28 @@
+# Rust target directory
+/target/
+
+# Cargo lockfile (for libraries, we can keep or ignore, standard for workspaces is to ignore build artifacts)
+**/*.rs.bk
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment and sensitive data
+.env
+.env.*
+*.pem
+*.key
+tokens.json
+
+# Scratch and test files
+scratch/

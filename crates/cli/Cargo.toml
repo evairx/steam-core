@@ -1,0 +1,16 @@
+[package]
+name = "steam-login"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool to authenticate with Steam and generate web session cookies"
+
+[[bin]]
+name = "steam-login"
+path = "src/main.rs"
+
+[dependencies]
+steam-auth = { path = "../core" }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+rpassword = "7.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
