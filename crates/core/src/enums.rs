@@ -1,7 +1,7 @@
 //! Enumerations representing Steam platform types, guard types, and status codes.
 
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// The target platform for which authentication tokens are issued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -195,8 +195,14 @@ mod tests {
 
     #[test]
     fn test_platform_type_conversion() {
-        assert_eq!(EAuthTokenPlatformType::from(2), EAuthTokenPlatformType::WebBrowser);
-        assert_eq!(EAuthTokenPlatformType::from(999), EAuthTokenPlatformType::Unknown);
+        assert_eq!(
+            EAuthTokenPlatformType::from(2),
+            EAuthTokenPlatformType::WebBrowser
+        );
+        assert_eq!(
+            EAuthTokenPlatformType::from(999),
+            EAuthTokenPlatformType::Unknown
+        );
     }
 
     #[test]

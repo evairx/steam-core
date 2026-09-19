@@ -1,30 +1,39 @@
 //! Low-level HTTP and Protobuf transport for Steam WebAPI (`IAuthenticationService`).
 
-use std::collections::HashMap;
-use std::time::Duration;
 use base64::Engine;
 use prost::Message;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+use url::Url;
 
+use crate::enums::EAuthTokenPlatformType;
 use crate::error::{Result, SteamError};
 use crate::proto::{
     CAuthenticationAccessTokenGenerateForAppRequest,
     CAuthenticationAccessTokenGenerateForAppResponse,
     CAuthenticationBeginAuthSessionViaCredentialsRequest,
     CAuthenticationBeginAuthSessionViaCredentialsResponse,
-    CAuthenticationBeginAuthSessionViaQrRequest,
-    CAuthenticationBeginAuthSessionViaQrResponse,
-    CAuthenticationPollAuthSessionStatusRequest,
-    CAuthenticationPollAuthSessionStatusResponse,
+    CAuthenticationBeginAuthSessionViaQrRequest, CAuthenticationBeginAuthSessionViaQrResponse,
+    CAuthenticationGetAuthSessionInfoRequest, CAuthenticationGetAuthSessionInfoResponse,
+    CAuthenticationPollAuthSessionStatusRequest, CAuthenticationPollAuthSessionStatusResponse,
+    CAuthenticationTokenRevokeRequest, CAuthenticationTokenRevokeResponse,
+    CAuthenticationUpdateAuthSessionWithMobileConfirmationRequest,
+    CAuthenticationUpdateAuthSessionWithMobileConfirmationResponse,
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeRequest,
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeResponse,
+};
+use crate::transport::{
+    HttpMethod, HttpRequest, HttpResponse, HttpTransport, ReqwestTransport, TransportFuture,
+    DEFAULT_REQUEST_TIMEOUT, MAX_RESPONSE_BYTES,
 };
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 const STEAM_API_BASE: &str = "https://api.steampowered.com";
 const STEAM_LOGIN_BASE: &str = "https://login.steampowered.com";
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize, Debug)]
 struct RsaKeyWrapper {
@@ -49,7 +58,7 @@ pub struct SteamRsaKey {
     pub timestamp: u64,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 struct FinalizeLoginResponse {
     #[serde(rename = "steamID")]
     steam_id: Option<String>,
@@ -57,28 +66,71 @@ struct FinalizeLoginResponse {
     error: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Clone)]
 struct TransferInfo {
     url: String,
     params: HashMap<String, String>,
 }
 
 /// Web authentication cookies returned after finalizing a Steam login session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SteamWebCookies {
     /// The active session ID.
-    pub session_id: String,
+    pub(crate) session_id: String,
     /// The primary authentication cookie `steamLoginSecure`.
-    pub steam_login_secure: Option<String>,
+    pub(crate) steam_login_secure: Option<String>,
     /// All raw `Set-Cookie` strings returned by Steam's domains.
-    pub all_cookies: Vec<String>,
+    pub(crate) all_cookies: Vec<String>,
+}
+
+impl fmt::Debug for SteamWebCookies {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SteamWebCookies")
+            .field("has_session_id", &!self.session_id.is_empty())
+            .field("has_steam_login_secure", &self.steam_login_secure.is_some())
+            .field("cookie_count", &self.all_cookies.len())
+            .finish()
+    }
+}
+
+impl SteamWebCookies {
+    /// Returns the session ID for callers that explicitly need to export it.
+    pub fn export_session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Returns the Steam login cookie for callers that explicitly need to export it.
+    pub fn export_steam_login_secure(&self) -> Option<&str> {
+        self.steam_login_secure.as_deref()
+    }
+
+    /// Returns all cookie values for callers that explicitly need to export them.
+    pub fn export_all_cookies(&self) -> &[String] {
+        &self.all_cookies
+    }
 }
 
 /// Low-level HTTP client for communicating with Steam API services.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SteamApiClient {
-    http: reqwest::Client,
-    base_url: String,
+    transport: Arc<dyn HttpTransport>,
+    user_agent: String,
+    platform_headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for SteamApiClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SteamApiClient").finish_non_exhaustive()
+    }
+}
+
+// Preserve the infallible constructor without silently dropping timeout/security settings.
+struct UnavailableTransport;
+
+impl HttpTransport for UnavailableTransport {
+    fn execute(&self, _request: HttpRequest) -> TransportFuture<'_, HttpResponse> {
+        Box::pin(async { Err(SteamError::Transport) })
+    }
 }
 
 impl Default for SteamApiClient {
@@ -89,14 +141,42 @@ impl Default for SteamApiClient {
 
 impl SteamApiClient {
     /// Constructs a new `SteamApiClient` with sensible browser defaults.
+    ///
+    /// If initialization fails, operations return `SteamError::Transport`.
+    /// Use the builder to handle initialization errors immediately.
     pub fn new() -> Self {
-        Self::builder().build().unwrap_or_else(|_| {
-            // Fallback to basic client if custom build fails
-            Self {
-                http: reqwest::Client::new(),
-                base_url: STEAM_API_BASE.to_string(),
-            }
-        })
+        Self::builder()
+            .build()
+            .unwrap_or_else(|_| Self::with_transport(Arc::new(UnavailableTransport)))
+    }
+
+    /// Uses the supplied transport for every endpoint, including login transfers.
+    ///
+    /// The transport must not follow redirects; it owns TLS, timeouts, and cookies.
+    pub fn with_transport(transport: Arc<dyn HttpTransport>) -> Self {
+        Self {
+            transport,
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            platform_headers: Vec::new(),
+        }
+    }
+
+    /// Applies request headers required by Steam's selected authentication platform.
+    ///
+    /// This only configures WebAPI authentication requests. `SteamClient` still requires the CM
+    /// transport and is rejected by the high-level login facade until that transport exists.
+    pub fn with_auth_platform(mut self, platform: EAuthTokenPlatformType) -> Self {
+        self.platform_headers = match platform {
+            EAuthTokenPlatformType::MobileApp => vec![(
+                "Cookie".into(),
+                "mobileClientVersion=0 (2.10.2); mobileClient=android; Steam_Language=english; dob="
+                    .into(),
+            )],
+            EAuthTokenPlatformType::WebBrowser
+            | EAuthTokenPlatformType::SteamClient
+            | EAuthTokenPlatformType::Unknown => Vec::new(),
+        };
+        self
     }
 
     /// Creates a builder for fine-grained configuration of the HTTP client.
@@ -106,41 +186,46 @@ impl SteamApiClient {
 
     /// Fetches the RSA public key and timestamp for a given account name.
     pub async fn get_password_rsa_public_key(&self, account_name: &str) -> Result<SteamRsaKey> {
-        let url = format!(
-            "{}/IAuthenticationService/GetPasswordRSAPublicKey/v1/",
-            self.base_url
+        let mut request = self.request(
+            HttpMethod::Get,
+            format!("{STEAM_API_BASE}/IAuthenticationService/GetPasswordRSAPublicKey/v1/"),
         );
+        request
+            .query
+            .push(("account_name".into(), account_name.into()));
+        let res = self.execute(request, false).await?;
 
-        let res = self
-            .http
-            .get(&url)
-            .query(&[("account_name", account_name)])
-            .send()
-            .await?;
-
-        self.check_eresult_header(&res)?;
-
-        let wrapper: RsaKeyWrapper = res.json().await?;
-        let inner = wrapper
-            .response
-            .ok_or_else(|| SteamError::Internal("Empty response from Steam RSA key endpoint".into()))?;
+        let wrapper: RsaKeyWrapper = serde_json::from_slice(&res.body)
+            .map_err(|_| SteamError::InvalidResponse("Invalid RSA response JSON"))?;
+        let inner = wrapper.response.ok_or(SteamError::InvalidResponse(
+            "Empty response from Steam RSA key endpoint",
+        ))?;
 
         let publickey_mod = inner
             .publickey_mod
-            .ok_or_else(|| SteamError::Internal("Missing publickey_mod in RSA response".into()))?;
+            .ok_or(SteamError::InvalidResponse("Missing RSA modulus"))?;
         let publickey_exp = inner
             .publickey_exp
-            .ok_or_else(|| SteamError::Internal("Missing publickey_exp in RSA response".into()))?;
+            .ok_or(SteamError::InvalidResponse("Missing RSA exponent"))?;
+
+        for value in [&publickey_mod, &publickey_exp] {
+            let bytes = hex::decode(value)
+                .map_err(|_| SteamError::InvalidResponse("Invalid RSA key hexadecimal"))?;
+            if !bytes.iter().any(|byte| *byte != 0) {
+                return Err(SteamError::InvalidResponse(
+                    "Empty or zero RSA key component",
+                ));
+            }
+        }
 
         let timestamp = match inner.timestamp {
-            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
-            Some(serde_json::Value::String(s)) => s.parse::<u64>().unwrap_or(0),
-            _ => {
-                return Err(SteamError::Internal(
-                    "Invalid or missing timestamp in RSA response".into(),
-                ))
-            }
-        };
+            Some(serde_json::Value::Number(n)) => n.as_u64().filter(|value| *value != 0),
+            Some(serde_json::Value::String(s)) => parse_positive_u64(&s),
+            _ => None,
+        }
+        .ok_or(SteamError::InvalidResponse(
+            "Invalid or missing RSA timestamp",
+        ))?;
 
         Ok(SteamRsaKey {
             publickey_mod,
@@ -191,6 +276,38 @@ impl SteamApiClient {
         .await
     }
 
+    /// Retrieves details for a pending session that a Steam Mobile App user may approve.
+    pub async fn get_auth_session_info(
+        &self,
+        access_token: &str,
+        request: &CAuthenticationGetAuthSessionInfoRequest,
+    ) -> Result<CAuthenticationGetAuthSessionInfoResponse> {
+        self.send_protobuf_request_with_access_token(
+            "IAuthenticationService",
+            "GetAuthSessionInfo",
+            1,
+            request,
+            access_token,
+        )
+        .await
+    }
+
+    /// Approves a pending session through a Steam Mobile App authenticator proof.
+    pub async fn update_auth_session_with_mobile_confirmation(
+        &self,
+        access_token: &str,
+        request: &CAuthenticationUpdateAuthSessionWithMobileConfirmationRequest,
+    ) -> Result<CAuthenticationUpdateAuthSessionWithMobileConfirmationResponse> {
+        self.send_protobuf_request_with_access_token(
+            "IAuthenticationService",
+            "UpdateAuthSessionWithMobileConfirmation",
+            1,
+            request,
+            access_token,
+        )
+        .await
+    }
+
     /// Polls the status of an ongoing authentication session.
     pub async fn poll_auth_session_status(
         &self,
@@ -219,86 +336,138 @@ impl SteamApiClient {
         .await
     }
 
+    /// Revokes a token through Steam's authentication service.
+    pub async fn revoke_token(&self, token: &str) -> Result<()> {
+        if token.is_empty() {
+            return Err(SteamError::InvalidToken(
+                "Cannot revoke an empty Steam token".into(),
+            ));
+        }
+
+        let request = CAuthenticationTokenRevokeRequest {
+            token: Some(token.to_string()),
+            revoke_action: None,
+        };
+        let _: CAuthenticationTokenRevokeResponse = self
+            .send_protobuf_request("IAuthenticationService", "RevokeToken", 1, &request)
+            .await?;
+        Ok(())
+    }
+
     /// Finalizes the web login session using the refresh token, retrieving `steamLoginSecure` and other cookies.
-    pub async fn finalize_login(&self, refresh_token: &str, steam_id: Option<u64>) -> Result<SteamWebCookies> {
+    pub async fn finalize_login(
+        &self,
+        refresh_token: &str,
+        steam_id: Option<u64>,
+    ) -> Result<SteamWebCookies> {
+        if refresh_token.trim().is_empty() || steam_id == Some(0) {
+            return Err(SteamError::InvalidToken(
+                "Invalid login finalization input".into(),
+            ));
+        }
         let random_bytes: [u8; 12] = rand::random();
         let session_id = hex::encode(random_bytes);
 
-        let finalize_url = format!("{}/jwt/finalizelogin", STEAM_LOGIN_BASE);
-        let mut form = HashMap::new();
-        form.insert("nonce", refresh_token);
-        form.insert("sessionid", &session_id);
-        form.insert("redir", "https://steamcommunity.com/login/home/?goto=");
-
-        let res = self
-            .http
-            .post(&finalize_url)
-            .header("Origin", "https://steamcommunity.com")
-            .header("Referer", "https://steamcommunity.com/")
-            .form(&form)
-            .send()
-            .await?;
-
-        let mut all_cookies = Vec::new();
-        for cookie_header in res.headers().get_all(reqwest::header::SET_COOKIE) {
-            if let Ok(cookie_str) = cookie_header.to_str() {
-                all_cookies.push(cookie_str.to_string());
-            }
+        let mut request = self.request(
+            HttpMethod::Post,
+            format!("{STEAM_LOGIN_BASE}/jwt/finalizelogin"),
+        );
+        request.form = vec![
+            ("nonce".into(), refresh_token.into()),
+            ("sessionid".into(), session_id.clone()),
+            (
+                "redir".into(),
+                "https://steamcommunity.com/login/home/?goto=".into(),
+            ),
+        ];
+        let res = self.execute(request, false).await?;
+        let finalize_data: FinalizeLoginResponse = serde_json::from_slice(&res.body)
+            .map_err(|_| SteamError::InvalidResponse("Invalid finalize login JSON"))?;
+        if finalize_data.error.is_some() {
+            return Err(SteamError::InvalidResponse(
+                "Steam rejected login finalization",
+            ));
         }
 
-        let finalize_data: FinalizeLoginResponse = res.json().await.map_err(|e| {
-            SteamError::Internal(format!("Failed to parse finalize login response: {e}"))
-        })?;
-
-        if let Some(err) = finalize_data.error {
-            return Err(SteamError::Internal(format!("Finalize login rejected: {err}")));
-        }
-
-        let sid = finalize_data
+        let returned_id = finalize_data
             .steam_id
-            .or_else(|| steam_id.map(|id| id.to_string()))
-            .unwrap_or_default();
-
-        // Perform token transfers to steamcommunity.com and store.steampowered.com
-        if let Some(transfers) = finalize_data.transfer_info {
-            for transfer in transfers {
-                let mut transfer_form = HashMap::new();
-                transfer_form.insert("steamID".to_string(), sid.clone());
-                for (k, v) in transfer.params {
-                    transfer_form.insert(k, v);
-                }
-
-                if let Ok(t_res) = self
-                    .http
-                    .post(&transfer.url)
-                    .form(&transfer_form)
-                    .send()
-                    .await
-                {
-                    for cookie_header in t_res.headers().get_all(reqwest::header::SET_COOKIE) {
-                        if let Ok(cookie_str) = cookie_header.to_str() {
-                            all_cookies.push(cookie_str.to_string());
-                        }
-                    }
-                }
+            .as_deref()
+            .map(|id| {
+                parse_positive_u64(id)
+                    .ok_or(SteamError::InvalidResponse("Invalid finalize SteamID"))
+            })
+            .transpose()?;
+        if let (Some(expected), Some(actual)) = (steam_id, returned_id) {
+            if expected != actual {
+                return Err(SteamError::InvalidResponse(
+                    "Finalize SteamID does not match requested identity",
+                ));
             }
         }
+        let sid = returned_id
+            .or(steam_id)
+            .ok_or(SteamError::InvalidResponse("Missing finalize SteamID"))?
+            .to_string();
 
-        // Find steamLoginSecure cookie
-        let mut steam_login_secure = None;
-        for c in &all_cookies {
-            if c.starts_with("steamLoginSecure=") {
-                let val = c.split(';').next().unwrap_or(c);
-                steam_login_secure = Some(val.to_string());
-                break;
+        // Validate the entire transfer list before sending any credentials to it.
+        let mut transfers = finalize_data.transfer_info.unwrap_or_default();
+        for transfer in &mut transfers {
+            let url = Url::parse(&transfer.url)
+                .map_err(|_| SteamError::InvalidResponse("Invalid login transfer URL"))?;
+            if !is_allowed_transfer_url(&url) {
+                return Err(SteamError::InvalidResponse("Untrusted login transfer URL"));
             }
+            transfer.url = url.to_string();
+            if transfer
+                .params
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("steamID") && value != &sid)
+            {
+                return Err(SteamError::InvalidResponse(
+                    "Transfer SteamID does not match requested identity",
+                ));
+            }
+            transfer
+                .params
+                .retain(|name, _| !name.eq_ignore_ascii_case("steamID"));
+            transfer.params.insert("steamID".into(), sid.clone());
         }
 
+        let mut all_cookies: Vec<String> = res
+            .headers
+            .into_iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, value)| value)
+            .collect();
+        for transfer in transfers {
+            let mut request = self.request(HttpMethod::Post, transfer.url);
+            request.form = transfer.params.into_iter().collect();
+            let res = self.execute(request, false).await?;
+            all_cookies.extend(
+                res.headers
+                    .into_iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                    .map(|(_, value)| value),
+            );
+        }
+
+        let steam_login_secure = all_cookies
+            .iter()
+            .find_map(|cookie| {
+                let pair = cookie.split(';').next()?.trim();
+                let value = pair.strip_prefix("steamLoginSecure=")?;
+                (!value.trim_matches('"').trim().is_empty()
+                    && !value.bytes().any(|byte| byte.is_ascii_control()))
+                .then(|| pair.to_string())
+            })
+            .ok_or(SteamError::InvalidResponse(
+                "Missing or empty steamLoginSecure cookie",
+            ))?;
         all_cookies.push(format!("sessionid={session_id}"));
 
         Ok(SteamWebCookies {
             session_id,
-            steam_login_secure,
+            steam_login_secure: Some(steam_login_secure),
             all_cookies,
         })
     }
@@ -311,83 +480,149 @@ impl SteamApiClient {
         version: u32,
         request: &Req,
     ) -> Result<Res> {
-        let url = format!("{}/{}/{}/v{}/", self.base_url, service, method, version);
+        self.send_protobuf_request_internal(service, method, version, request, None)
+            .await
+    }
+
+    async fn send_protobuf_request_with_access_token<Req: Message, Res: Message + Default>(
+        &self,
+        service: &str,
+        method: &str,
+        version: u32,
+        request: &Req,
+        access_token: &str,
+    ) -> Result<Res> {
+        if access_token.is_empty() {
+            return Err(SteamError::InvalidToken(
+                "A non-empty access token is required".into(),
+            ));
+        }
+        self.send_protobuf_request_internal(service, method, version, request, Some(access_token))
+            .await
+    }
+
+    async fn send_protobuf_request_internal<Req: Message, Res: Message + Default>(
+        &self,
+        service: &str,
+        method: &str,
+        version: u32,
+        request: &Req,
+        access_token: Option<&str>,
+    ) -> Result<Res> {
+        let url = format!("{STEAM_API_BASE}/{service}/{method}/v{version}/");
 
         let proto_bytes = request.encode_to_vec();
         let encoded_b64 = base64::prelude::BASE64_STANDARD.encode(&proto_bytes);
 
-        let res = self
-            .http
-            .post(&url)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header("Origin", "https://steamcommunity.com")
-            .header("Referer", "https://steamcommunity.com/")
-            .form(&[("input_protobuf_encoded", &encoded_b64)])
-            .send()
-            .await?;
-
-        let eresult = res
-            .headers()
-            .get("x-eresult")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(1);
-
-        let error_msg = res
-            .headers()
-            .get("x-error-message")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-
-        let bytes = res.bytes().await?;
-
-        if eresult != 1 {
-            let detail = error_msg.unwrap_or_else(|| match eresult {
-                5 => "Invalid credentials (k_EResultInvalidPassword)".to_string(),
-                84 => "Rate limit exceeded (k_EResultRateLimitExceeded)".to_string(),
-                other => format!("Steam API EResult {other}"),
-            });
-
-            return Err(SteamError::SteamApi {
-                eresult,
-                message: detail,
-            });
+        let mut request = self.request(HttpMethod::Post, url);
+        if let Some(access_token) = access_token {
+            request
+                .headers
+                .push(("Authorization".into(), format!("Bearer {access_token}")));
         }
-
-        let response_proto = Res::decode(bytes.as_ref())?;
-        Ok(response_proto)
+        request
+            .form
+            .push(("input_protobuf_encoded".into(), encoded_b64));
+        let res = self.execute(request, true).await?;
+        Res::decode(res.body.as_slice())
+            .map_err(|_| SteamError::InvalidResponse("Invalid protobuf response"))
     }
 
-    fn check_eresult_header(&self, res: &reqwest::Response) -> Result<()> {
-        if let Some(eresult_header) = res.headers().get("x-eresult") {
-            if let Ok(val_str) = eresult_header.to_str() {
-                if let Ok(eresult_code) = val_str.parse::<i32>() {
-                    if eresult_code != 1 {
-                        let error_msg = res
-                            .headers()
-                            .get("x-error-message")
-                            .and_then(|h| h.to_str().ok())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("Steam API returned EResult {eresult_code}"));
-
-                        return Err(SteamError::SteamApi {
-                            eresult: eresult_code,
-                            message: error_msg,
-                        });
-                    }
-                }
-            }
+    fn request(&self, method: HttpMethod, url: String) -> HttpRequest {
+        let mut headers: Vec<(String, String)> = [
+            ("User-Agent", self.user_agent.as_str()),
+            ("Accept", "application/json, text/plain, */*"),
+            ("Origin", "https://steamcommunity.com"),
+            ("Referer", "https://steamcommunity.com/"),
+            ("Sec-Fetch-Site", "cross-site"),
+            ("Sec-Fetch-Mode", "cors"),
+            ("Sec-Fetch-Dest", "empty"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        headers.extend(self.platform_headers.iter().cloned());
+        if method == HttpMethod::Post {
+            headers.push((
+                "Content-Type".into(),
+                "application/x-www-form-urlencoded".into(),
+            ));
         }
-        Ok(())
+        HttpRequest {
+            method,
+            url,
+            headers,
+            form: Vec::new(),
+            query: Vec::new(),
+        }
+    }
+
+    async fn execute(&self, request: HttpRequest, require_eresult: bool) -> Result<HttpResponse> {
+        let res = self
+            .transport
+            .execute(request)
+            .await
+            .map_err(|error| match error {
+                SteamError::InvalidResponse(_) | SteamError::HttpStatus(_) => error,
+                _ => SteamError::Transport,
+            })?;
+        if res.body.len() > MAX_RESPONSE_BYTES {
+            return Err(SteamError::InvalidResponse("HTTP response exceeds 2 MiB"));
+        }
+        if !(200..300).contains(&res.status) {
+            return Err(SteamError::HttpStatus(res.status));
+        }
+        let mut headers = res
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-eresult"));
+        let Some((_, value)) = headers.next() else {
+            return if require_eresult {
+                Err(SteamError::InvalidResponse("Missing EResult header"))
+            } else {
+                Ok(res)
+            };
+        };
+        if headers.next().is_some()
+            || value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(SteamError::InvalidResponse("Malformed EResult header"));
+        }
+        let eresult = value
+            .parse::<i32>()
+            .map_err(|_| SteamError::InvalidResponse("Malformed EResult header"))?;
+        if eresult != 1 {
+            let message = match eresult {
+                5 => "Invalid credentials (k_EResultInvalidPassword)",
+                84 => "Rate limit exceeded (k_EResultRateLimitExceeded)",
+                _ => "Steam API rejected the request",
+            };
+            return Err(SteamError::SteamApi {
+                eresult,
+                message: message.into(),
+            });
+        }
+        Ok(res)
     }
 }
 
 /// Builder for constructing a configured [`SteamApiClient`].
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct SteamApiClientBuilder {
     user_agent: Option<String>,
     proxy_url: Option<String>,
     timeout: Option<Duration>,
+}
+
+impl fmt::Debug for SteamApiClientBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SteamApiClientBuilder")
+            .field("has_user_agent", &self.user_agent.is_some())
+            .field("has_proxy", &self.proxy_url.is_some())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl SteamApiClientBuilder {
@@ -411,30 +646,267 @@ impl SteamApiClientBuilder {
 
     /// Builds the `SteamApiClient`.
     pub fn build(self) -> Result<SteamApiClient> {
-        let mut headers = HeaderMap::new();
-        let ua = self.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT);
-        headers.insert(USER_AGENT, HeaderValue::from_str(ua).map_err(|e| SteamError::Internal(e.to_string()))?);
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/plain, */*"));
-        headers.insert("Origin", HeaderValue::from_static("https://steamcommunity.com"));
-        headers.insert("Referer", HeaderValue::from_static("https://steamcommunity.com/"));
-        headers.insert("Sec-Fetch-Site", HeaderValue::from_static("cross-site"));
-        headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
-        headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
+        let user_agent = self.user_agent.unwrap_or_else(|| DEFAULT_USER_AGENT.into());
+        HeaderValue::from_str(&user_agent).map_err(|_| SteamError::Transport)?;
+        let transport = ReqwestTransport::configured(
+            self.timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            self.proxy_url.as_deref(),
+        )?;
+        Ok(SteamApiClient {
+            transport: Arc::new(transport),
+            user_agent,
+            platform_headers: Vec::new(),
+        })
+    }
+}
 
-        let mut builder = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(self.timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT));
+fn is_allowed_transfer_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && url.fragment().is_none()
+        && matches!(
+            url.host_str(),
+            Some("steamcommunity.com" | "store.steampowered.com" | "help.steampowered.com")
+        )
+}
 
-        if let Some(proxy_url) = self.proxy_url {
-            let proxy = reqwest::Proxy::all(&proxy_url)
-                .map_err(|e| SteamError::Internal(format!("Invalid proxy configuration: {e}")))?;
-            builder = builder.proxy(proxy);
+fn parse_positive_u64(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u64>().ok().filter(|value| *value != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakeTransport {
+        requests: Mutex<Vec<HttpRequest>>,
+        responses: Mutex<VecDeque<HttpResponse>>,
+    }
+
+    impl FakeTransport {
+        fn with_responses(responses: impl IntoIterator<Item = HttpResponse>) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses.into_iter().collect()),
+            }
         }
 
-        let http = builder.build()?;
-        Ok(SteamApiClient {
-            http,
-            base_url: STEAM_API_BASE.to_string(),
-        })
+        fn requests(&self) -> Vec<HttpRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    impl HttpTransport for FakeTransport {
+        fn execute(&self, request: HttpRequest) -> TransportFuture<'_, HttpResponse> {
+            self.requests.lock().expect("requests lock").push(request);
+            let response = self
+                .responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .ok_or(SteamError::InvalidResponse("Unexpected HTTP request"));
+            Box::pin(async move { response })
+        }
+    }
+
+    fn response(status: u16, headers: &[(&str, &str)], body: impl Into<Vec<u8>>) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn cookie_debug_output_redacts_secret_values() {
+        let cookies = SteamWebCookies {
+            session_id: "session-secret".into(),
+            steam_login_secure: Some("login-secret".into()),
+            all_cookies: vec!["cookie-secret".into()],
+        };
+
+        let output = format!("{cookies:?}");
+        assert!(!output.contains("session-secret"));
+        assert!(!output.contains("login-secret"));
+        assert!(!output.contains("cookie-secret"));
+    }
+
+    #[test]
+    fn login_transfers_are_restricted_to_https_steam_hosts() {
+        assert!(is_allowed_transfer_url(
+            &Url::parse("https://steamcommunity.com/login/transfer").unwrap()
+        ));
+        assert!(is_allowed_transfer_url(
+            &Url::parse("https://store.steampowered.com/login/transfer").unwrap()
+        ));
+        assert!(!is_allowed_transfer_url(
+            &Url::parse("http://steamcommunity.com/login/transfer").unwrap()
+        ));
+        assert!(!is_allowed_transfer_url(
+            &Url::parse("https://steamcommunity.example/login/transfer").unwrap()
+        ));
+        assert!(!is_allowed_transfer_url(
+            &Url::parse("https://user:secret@steamcommunity.com/login/transfer").unwrap()
+        ));
+        assert!(!is_allowed_transfer_url(
+            &Url::parse("https://steamcommunity.com:8443/login/transfer").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn protobuf_contract_requires_explicit_success_eresult() {
+        let fake = Arc::new(FakeTransport::with_responses([response(
+            200,
+            &[],
+            Vec::new(),
+        )]));
+        let client = SteamApiClient::with_transport(Arc::clone(&fake) as Arc<dyn HttpTransport>);
+        let request = CAuthenticationPollAuthSessionStatusRequest {
+            client_id: Some(42),
+            request_id: Some(vec![1, 2, 3]),
+            token_to_revoke: None,
+        };
+
+        assert!(matches!(
+            client.poll_auth_session_status(&request).await,
+            Err(SteamError::InvalidResponse("Missing EResult header"))
+        ));
+        let recorded = fake.requests();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, HttpMethod::Post);
+        assert!(recorded[0]
+            .form
+            .iter()
+            .any(|(name, _)| name == "input_protobuf_encoded"));
+        let encoded = recorded[0]
+            .form
+            .iter()
+            .find(|(name, _)| name == "input_protobuf_encoded")
+            .expect("protobuf form field")
+            .1
+            .clone();
+        assert!(!format!("{:?}", recorded[0]).contains(&encoded));
+    }
+
+    #[tokio::test]
+    async fn protobuf_rejections_and_bad_bodies_are_typed_and_redacted() {
+        let fake = Arc::new(FakeTransport::with_responses([
+            response(
+                200,
+                &[
+                    ("x-eresult", "84"),
+                    ("x-error-message", "secret remote reason"),
+                ],
+                Vec::new(),
+            ),
+            response(200, &[("x-eresult", "1")], [0xff, 0xff]),
+        ]));
+        let client = SteamApiClient::with_transport(Arc::clone(&fake) as Arc<dyn HttpTransport>);
+        let request = CAuthenticationPollAuthSessionStatusRequest::default();
+
+        let rejection = client.poll_auth_session_status(&request).await.unwrap_err();
+        assert!(matches!(
+            rejection,
+            SteamError::SteamApi { eresult: 84, .. }
+        ));
+        assert!(!format!("{rejection} {rejection:?}").contains("secret remote reason"));
+        assert!(matches!(
+            client.poll_auth_session_status(&request).await,
+            Err(SteamError::InvalidResponse("Invalid protobuf response"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mobile_platform_requests_include_mobile_authentication_cookie() {
+        let fake = Arc::new(FakeTransport::with_responses([response(
+            200,
+            &[("x-eresult", "1")],
+            Vec::new(),
+        )]));
+        let client = SteamApiClient::with_transport(Arc::clone(&fake) as Arc<dyn HttpTransport>)
+            .with_auth_platform(crate::EAuthTokenPlatformType::MobileApp);
+        client
+            .poll_auth_session_status(&CAuthenticationPollAuthSessionStatusRequest::default())
+            .await
+            .expect("mobile poll request");
+        let request = fake.requests().pop().expect("recorded request");
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "Cookie" && value.contains("mobileClient=android") }));
+        assert!(!format!("{request:?}").contains("mobileClient=android"));
+    }
+
+    #[tokio::test]
+    async fn rsa_and_finalize_contracts_reject_incomplete_or_inconsistent_responses() {
+        let fake = Arc::new(FakeTransport::with_responses([response(
+            200,
+            &[],
+            br#"{"response":{"publickey_mod":"00","publickey_exp":"010001","timestamp":"0"}}"#
+                .to_vec(),
+        )]));
+        let client = SteamApiClient::with_transport(Arc::clone(&fake) as Arc<dyn HttpTransport>);
+        assert!(matches!(
+            client.get_password_rsa_public_key("account").await,
+            Err(SteamError::InvalidResponse(_))
+        ));
+
+        let fake = Arc::new(FakeTransport::with_responses([response(
+            200,
+            &[],
+            br#"{"steamID":"43"}"#.to_vec(),
+        )]));
+        let client = SteamApiClient::with_transport(fake as Arc<dyn HttpTransport>);
+        assert!(matches!(
+            client.finalize_login("refresh-secret", Some(42)).await,
+            Err(SteamError::InvalidResponse(
+                "Finalize SteamID does not match requested identity"
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn login_transfer_keeps_the_validated_steam_identity() {
+        let fake = Arc::new(FakeTransport::with_responses([
+            response(
+                200,
+                &[("Set-Cookie", "steamLoginSecure=first-cookie; Secure")],
+                br#"{"steamID":"42","transfer_info":[{"url":"https://steamcommunity.com/login/transfer","params":{"steamID":"42","token":"secret-transfer"}}]}"#.to_vec(),
+            ),
+            response(200, &[("Set-Cookie", "another=value; Secure")], Vec::new()),
+        ]));
+        let client = SteamApiClient::with_transport(Arc::clone(&fake) as Arc<dyn HttpTransport>);
+        let cookies = client
+            .finalize_login("refresh-secret", Some(42))
+            .await
+            .expect("valid finalization");
+        assert!(cookies.export_steam_login_secure().is_some());
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 2);
+        let transfer = &requests[1];
+        assert_eq!(
+            transfer
+                .form
+                .iter()
+                .filter(|(name, _)| name == "steamID")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["42"]
+        );
+        assert!(!format!("{transfer:?}").contains("secret-transfer"));
+        let proto = CAuthenticationPollAuthSessionStatusResponse::default();
+        assert_eq!(proto.encode_to_vec(), Vec::<u8>::new());
     }
 }

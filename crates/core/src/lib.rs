@@ -1,50 +1,47 @@
 //! # steam-core
 //!
-//! All-in-one high-performance Steam client and authentication library in Rust,
-//! unifying authentication (`steam-session`) and Steam network client interactions (`steam-user`).
+//! Native Rust core for Steam authentication and session management.
 //!
 //! ## Key Capabilities
-//! - **Unified Architecture:** Seamlessly connects authentication (`SteamAuth`) with the client (`SteamUser`).
-//! - **Credentials & QR Auth:** RSA PKCS#1 v1.5 encryption, Steam Guard push notifications, TOTP codes, QR generation.
-//! - **Hardware-Backed OS Vault:** Stores tokens & cookies safely in Windows Credential Manager, macOS Keychain, or Linux Secret Service.
-//! - **Background Auto-Keeper:** Silently watches JWT token expiration and automatically rotates access tokens and web cookies before they expire.
-//! - **Steam Network Integration:** Connects to Valve's Connection Manager (CM) servers using validated `access_token` JWTs.
+//! - **Credentials and QR Auth:** RSA PKCS#1 v1.5 encryption, Steam Guard approval and QR generation.
+//! - **Explicit Secrets:** Tokens and cookies are redacted from `Debug` output and exported only by named methods.
+//! - **Session Store Boundary:** Hosts inject secure persistence; the optional keyring adapter is
+//!   not required for portable builds.
+//! - **Background Keeper:** Watches token expiration and publishes refreshed cookies when renewal succeeds.
+//! - **Client Foundations:** `SteamUser` currently models state; CM transport is not implemented yet.
 //!
 //! ## Quick Start
 //!
 //! ```no_run
-//! use steam_core::{SteamAuth, SteamUser, SteamUserOptions, EPersonaState, AuthEvent};
+//! use steam_core::{AuthEvent, SteamAuth};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // 1. One-line Login with automatic OS vault storage & restoration
+//!     // Start a login that uses mobile approval rather than a Steam Guard code.
 //!     let session = SteamAuth::load_or_login("username", "password", |event| {
 //!         if event == AuthEvent::NeedMobileConfirmation {
 //!             println!("Approve the notification on your phone!");
 //!         }
 //!     }).await?;
 //!
-//!     // 2. Start background auto-renewal (never let cookies or tokens expire)
+//!     // Start background renewal when the target platform supports it.
 //!     let _keeper = session.spawn_keeper(None);
-//!
-//!     // 3. Connect to the Steam network using the authenticated session
-//!     let mut user = SteamUser::connect(&session, SteamUserOptions::default()).await?;
-//!     user.set_persona_state(EPersonaState::Online).await?;
-//!     user.set_games_played(&[730]).await?; // Idle Counter-Strike 2
-//!
-//!     println!("Successfully logged on as: {}", user.account_name());
+//!     println!("Successfully logged on as: {}", session.account_name());
 //!     Ok(())
 //! }
 //! ```
 
+pub mod approver;
 pub mod auth;
 pub mod client;
 pub mod crypto;
 pub mod enums;
 pub mod error;
 pub mod keeper;
+pub mod runtime;
 pub mod session;
 pub mod tokens;
+pub mod transport;
 pub mod user;
 pub mod vault;
 
@@ -53,13 +50,21 @@ pub mod proto {
 }
 
 // Re-export primary types for ergonomics
-pub use auth::{AuthEvent, AuthenticatedSession, QrChallenge, SteamAuth};
+pub use approver::{AuthSessionInfo, LoginApprover};
+pub use auth::{
+    AuthEvent, AuthenticatedSession, CredentialsChallenge, LoginOptions, QrChallenge, SteamAuth,
+};
 pub use client::{SteamApiClient, SteamApiClientBuilder, SteamRsaKey, SteamWebCookies};
 pub use crypto::{encrypt_password, EncryptedPassword};
 pub use enums::{EAuthSessionGuardType, EAuthTokenPlatformType, EResult, ESessionPersistence};
 pub use error::{Result, SteamError};
 pub use keeper::{AutoKeeper, AutoKeeperHandle};
+pub use runtime::{
+    Clock, CmConnection, CmTransport, CoreFuture, OsRandom, RandomSource, Runtime, SystemClock,
+    TokioRuntime,
+};
 pub use session::{AuthTokens, CredentialsAuthSession, LoginSession, PollStatus, QrAuthSession};
 pub use tokens::{decode_jwt, is_token_expired, SteamJwtClaims};
+pub use transport::{HttpMethod, HttpRequest, HttpResponse, HttpTransport, ReqwestTransport};
 pub use user::{ECmProtocol, EPersonaState, SteamUser, SteamUserEvent, SteamUserOptions};
-pub use vault::{SavedSession, SessionVault};
+pub use vault::{MemorySessionStore, SavedSession, SessionStore, SessionVault};

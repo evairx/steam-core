@@ -1,10 +1,10 @@
-//! Native Steam User Client (`SteamUser`) for connecting to the Steam Connection Manager (CM) network.
+//! Steam user client foundations.
 //!
-//! Handles CM server discovery, session logon via `access_token`, persona state (online/offline/away),
-//! game idling (`games_played`), chat, and event streams.
+//! CM transport and protocol support are not implemented. Connection and presence operations
+//! return errors rather than presenting local state changes as remote success.
 
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::auth::AuthenticatedSession;
 use crate::error::{Result, SteamError};
@@ -80,14 +80,13 @@ pub struct CmServerEndpoint {
     pub dc: Option<String>,
 }
 
-/// Primary client for interacting with the Steam network as a logged-in user.
+/// Reserved client API for interacting with the Steam network as a logged-in user.
 ///
-/// Integrates seamlessly with [`AuthenticatedSession`] from `steam_core::auth`, using its
-/// `access_token` and `steam_id` to authenticate with Valve's Connection Managers.
+/// An [`AuthenticatedSession`] does not establish a CM connection. Until CM transport and
+/// logon are implemented, [`Self::connect`] cannot return a connected client.
 pub struct SteamUser {
     steam_id: u64,
     account_name: String,
-    access_token: String,
     current_persona_state: EPersonaState,
     currently_playing: Vec<u32>,
     options: SteamUserOptions,
@@ -95,28 +94,15 @@ pub struct SteamUser {
 }
 
 impl SteamUser {
-    /// Connects to the Steam network using the credentials and access token from an [`AuthenticatedSession`].
+    /// Attempts to connect using an authenticated session.
     ///
-    /// # Example
-    /// ```no_run
-    /// # async fn run() -> steam_core::Result<()> {
-    /// use steam_core::{SteamAuth, SteamUser, SteamUserOptions, EPersonaState};
-    ///
-    /// let session = SteamAuth::from_token("valid_refresh_token").await?;
-    /// let mut user = SteamUser::connect(&session, SteamUserOptions::default()).await?;
-    ///
-    /// user.set_persona_state(EPersonaState::Online).await?;
-    /// user.set_games_played(&[730]).await?; // CS2
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns [`SteamError::InvalidToken`] for an empty access token, otherwise
+    /// [`SteamError::CmNotImplemented`]. No transport is opened or CM logon performed.
     pub async fn connect(
         session: &AuthenticatedSession,
-        options: SteamUserOptions,
+        _options: SteamUserOptions,
     ) -> Result<Self> {
-        let steam_id = session.steam_id();
-        let access_token = session.access_token().to_string();
-        let account_name = session.account_name().to_string();
+        let access_token = session.export_access_token();
 
         if access_token.is_empty() {
             return Err(SteamError::InvalidToken(
@@ -124,16 +110,7 @@ impl SteamUser {
             ));
         }
 
-        // Mock connection initialization - in a full network pipeline this performs CM handshake
-        Ok(Self {
-            steam_id,
-            account_name,
-            access_token,
-            current_persona_state: options.initial_persona_state,
-            currently_playing: Vec::new(),
-            options,
-            is_connected: true,
-        })
+        Err(SteamError::CmNotImplemented)
     }
 
     /// Returns the 64-bit SteamID of the connected user.
@@ -146,11 +123,6 @@ impl SteamUser {
         &self.account_name
     }
 
-    /// Returns the access token used to authenticate this SteamUser.
-    pub fn access_token(&self) -> &str {
-        &self.access_token
-    }
-
     /// Returns the active configuration options.
     pub fn options(&self) -> &SteamUserOptions {
         &self.options
@@ -161,41 +133,109 @@ impl SteamUser {
         self.is_connected
     }
 
-    /// Sets the user's online persona state (Online, Away, Busy, Snooze, Invisible, etc.).
-    pub async fn set_persona_state(&mut self, state: EPersonaState) -> Result<()> {
-        if !self.is_connected {
-            return Err(SteamError::Internal("Not connected to Steam network".into()));
-        }
-        self.current_persona_state = state;
-        Ok(())
-    }
-
-    /// Sets the list of Steam AppIDs currently being played (e.g. `730` for Counter-Strike 2, `440` for TF2).
+    /// Requests a persona state change on Steam.
     ///
-    /// Used for hour boosting, idling trading cards, or displaying active game presence to friends.
-    pub async fn set_games_played(&mut self, app_ids: &[u32]) -> Result<()> {
-        if !self.is_connected {
-            return Err(SteamError::Internal("Not connected to Steam network".into()));
-        }
-        self.currently_playing = app_ids.to_vec();
-        Ok(())
+    /// Returns [`SteamError::CmNotImplemented`] without changing local or remote state.
+    pub async fn set_persona_state(&mut self, _state: EPersonaState) -> Result<()> {
+        Err(SteamError::CmNotImplemented)
     }
 
-    /// Returns the current list of AppIDs being played.
+    /// Requests a change to the Steam AppIDs currently being played.
+    ///
+    /// Returns [`SteamError::CmNotImplemented`] without changing local or remote state.
+    pub async fn set_games_played(&mut self, _app_ids: &[u32]) -> Result<()> {
+        Err(SteamError::CmNotImplemented)
+    }
+
+    /// Returns the locally stored AppIDs, not a query of remote Steam presence.
     pub fn games_played(&self) -> &[u32] {
         &self.currently_playing
     }
 
-    /// Returns the current persona state.
+    /// Returns the locally stored persona state, not a query of remote Steam presence.
     pub fn persona_state(&self) -> EPersonaState {
         self.current_persona_state
     }
 
-    /// Disconnects gracefully from the Steam CM network.
+    /// Clears local connection and presence state. No CM logoff message is sent.
     pub async fn disconnect(&mut self) -> Result<()> {
         self.is_connected = false;
         self.currently_playing.clear();
         self.current_persona_state = EPersonaState::Offline;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::SteamWebCookies;
+    use crate::enums::EAuthTokenPlatformType;
+    use crate::session::LoginSession;
+
+    #[tokio::test]
+    async fn connect_never_succeeds_without_cm_transport() {
+        for access_token in ["", "not-a-real-access-token"] {
+            // Local fixture only: no login, token validation, or network request.
+            let session = AuthenticatedSession::new(
+                "test-account".into(),
+                0,
+                String::new(),
+                access_token.into(),
+                SteamWebCookies {
+                    session_id: String::new(),
+                    steam_login_secure: None,
+                    all_cookies: Vec::new(),
+                },
+                LoginSession::new(EAuthTokenPlatformType::WebBrowser),
+            );
+
+            for protocol in [ECmProtocol::WebSocket, ECmProtocol::Tcp] {
+                let result = SteamUser::connect(
+                    &session,
+                    SteamUserOptions {
+                        protocol,
+                        ..SteamUserOptions::default()
+                    },
+                )
+                .await;
+
+                if access_token.is_empty() {
+                    assert!(matches!(result, Err(SteamError::InvalidToken(_))));
+                } else {
+                    assert!(matches!(result, Err(SteamError::CmNotImplemented)));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn presence_operations_never_report_remote_success() {
+        for is_connected in [false, true] {
+            // Even a fabricated local connected flag must not permit false success.
+            let mut user = SteamUser {
+                steam_id: 0,
+                account_name: "test-account".into(),
+                current_persona_state: EPersonaState::Offline,
+                currently_playing: vec![440],
+                options: SteamUserOptions::default(),
+                is_connected,
+            };
+
+            assert!(matches!(
+                user.set_persona_state(EPersonaState::Online).await,
+                Err(SteamError::CmNotImplemented)
+            ));
+            assert_eq!(user.persona_state(), EPersonaState::Offline);
+
+            for app_ids in [&[730][..], &[][..]] {
+                assert!(matches!(
+                    user.set_games_played(app_ids).await,
+                    Err(SteamError::CmNotImplemented)
+                ));
+                assert_eq!(user.games_played(), &[440]);
+            }
+            assert_eq!(user.is_connected(), is_connected);
+        }
     }
 }
